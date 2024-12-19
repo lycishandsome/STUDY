@@ -1,0 +1,302 @@
+
+from functools import partial
+
+import paddle
+from paddlenlp.datasets import MapDataset
+from paddlenlp.data import Stack, Tuple, Pad
+from paddlenlp.transformers import ErnieTokenizer, ErnieForTokenClassification
+from paddlenlp.metrics import ChunkEvaluator
+from utils import convert_example, evaluate, predict, load_dict
+
+import os
+
+def format_data(source_filename, target_filename):
+    datalist=[]
+    with open(source_filename, 'r', encoding='utf-8') as f:
+        lines=f.readlines()
+    words=''
+    labels=''
+    flag=0
+    for line in lines:  
+        if line == '\n':
+            item=words+'\t'+labels+'\n'
+            # print(item)
+            datalist.append(item)
+            words=''
+            labels=''
+            flag=0
+            continue
+        word, label = line.strip('\n').split(' ')
+        if flag==1:
+            words=words+'\002'+word
+            labels=labels+'\002'+label
+        else:
+            words=words+word
+            labels=labels+label
+            flag=1
+    with open(target_filename, 'w', encoding='utf-8') as f:
+        lines=f.writelines(datalist)
+    print(f'{source_filename}文件格式转换完毕，保存为{target_filename}')
+format_data('dataset/dev.conll', 'dataset/dev.txt')
+format_data(r'dataset/train.conll', r'dataset/train.txt')
+!head dataset/dev.txt
+
+def load_dataset(datafiles):
+    def read(data_path):
+        with open(data_path, 'r', encoding='utf-8') as fp:
+            next(fp)  # Skip header
+            for line in fp.readlines():
+                words, labels = line.strip('\n').split('\t')
+                words = words.split('\002')
+                labels = labels.split('\002')
+                yield words, labels
+
+    if isinstance(datafiles, str):
+        return MapDataset(list(read(datafiles)))
+    elif isinstance(datafiles, list) or isinstance(datafiles, tuple):
+        return [MapDataset(list(read(datafile))) for datafile in datafiles]
+
+# Create dataset, tokenizer and dataloader.
+train_ds, dev_ds = load_dataset(datafiles=(
+        './dataset/train.txt', './dataset/dev.txt'))
+
+for i in range(5):
+    print(train_ds[i])
+
+def gernate_dic(source_filename1, source_filename2, target_filename):
+    data_list = []
+
+    with open(source_filename1, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+
+    for line in lines:
+        if line != '\n':
+            dic = line.strip('\n').split(' ')[-1]
+            if dic + '\n' not in data_list:
+                data_list.append(dic + '\n')
+
+    with open(source_filename2, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+
+    for line in lines:
+        if line != '\n':
+            dic = line.strip('\n').split(' ')[-1]
+            if dic + '\n' not in data_list:
+                data_list.append(dic + '\n')
+
+    with open(target_filename, 'w', encoding='utf-8') as f:
+        lines = f.writelines(data_list)
+
+# 从dev文件生成dic
+gernate_dic('dataset/train.conll', 'dataset/dev.conll', 'dataset/mytag.dic')
+# gernate_dic('dataset/dev.conll', 'dataset/mytag_dev.dic')
+
+# 查看生成的dic文件
+!cat dataset/mytag.dic
+
+label_vocab = load_dict('./dataset/mytag.dic')
+tokenizer = ErnieTokenizer.from_pretrained('ernie-1.0')
+
+trans_func = partial(convert_example, tokenizer=tokenizer, label_vocab=label_vocab)
+
+train_ds.map(trans_func)
+dev_ds.map(trans_func)
+print (train_ds[0])
+
+ignore_label = -1
+batchify_fn = lambda samples, fn=Tuple(
+    Pad(axis=0, pad_val=tokenizer.pad_token_id),  # input_ids
+    Pad(axis=0, pad_val=tokenizer.pad_token_type_id),  # token_type_ids
+    Stack(),  # seq_len
+    Pad(axis=0, pad_val=ignore_label)  # labels
+): fn(samples)
+
+train_loader = paddle.io.DataLoader(
+    dataset=train_ds,
+    batch_size=300,
+    return_list=True,
+    collate_fn=batchify_fn)
+dev_loader = paddle.io.DataLoader(
+    dataset=dev_ds,
+    batch_size=300,
+    return_list=True,
+    collate_fn=batchify_fn)
+
+step = 0
+for epoch in range(50):
+    for idx, (input_ids, token_type_ids, length, labels) in enumerate(train_loader):
+        logits = model(input_ids, token_type_ids)
+        loss = paddle.mean(loss_fn(logits, labels))
+        loss.backward()
+        optimizer.step()
+        optimizer.clear_grad()
+        step += 1
+        print("epoch:%d - step:%d - loss: %f" % (epoch, step, loss))
+    evaluate(model, metric, dev_loader)
+
+    paddle.save(model.state_dict(),
+                './checkpoint/model_%d.pdparams' % step)
+
+import numpy as np
+import paddle
+from paddle.io import DataLoader
+import paddlenlp as ppnlp
+from paddlenlp.datasets import load_dataset
+from paddlenlp.data import Stack, Tuple, Pad, Dict
+from paddlenlp.datasets import MapDataset
+from paddlenlp.transformers import ErnieTokenizer, ErnieForTokenClassification
+from paddlenlp.metrics import ChunkEvaluator
+from utils import convert_example, evaluate, predict, load_dict
+from functools import partial
+
+def load_dataset(datafiles):
+    def read(data_path):
+        with open(data_path, 'r', encoding='utf-8') as fp:
+            # next(fp)  # 没有header，不用Skip header
+            for line in fp.readlines():
+                ids, words = line.strip('\n').split('\001')
+                words=[ch for ch in words]
+                # 要预测的数据集没有label，伪造个O，不知道可以不 ，应该后面预测不会用label
+                labels=['O' for x in range(0,len(words))]
+
+                yield words, labels
+                # yield words
+
+    if isinstance(datafiles, str):
+        return MapDataset(list(read(datafiles)))
+    elif isinstance(datafiles, list) or isinstance(datafiles, tuple):
+        return [MapDataset(list(read(datafile))) for datafile in datafiles]
+
+# Create dataset, tokenizer and dataloader.
+test_ds = load_dataset(datafiles=('./dataset/final_test.txt'))
+for i in range(20):
+    print(test_ds[i])
+
+label_vocab = load_dict('./dataset/mytag.dic')
+tokenizer = ErnieTokenizer.from_pretrained('ernie-1.0')
+
+trans_func = partial(convert_example, tokenizer=tokenizer, label_vocab=label_vocab)
+test_ds.map(trans_func)
+print (test_ds[0])
+ignore_label = 1
+batchify_fn = lambda samples, fn=Tuple(
+    Pad(axis=0, pad_val=tokenizer.pad_token_id),  # input_ids
+    Pad(axis=0, pad_val=tokenizer.pad_token_type_id),  # token_type_ids
+    Stack(),  # seq_len
+    Pad(axis=0, pad_val=ignore_label)  # labels
+): fn(samples)
+
+test_loader = paddle.io.DataLoader(
+    dataset=test_ds,
+    batch_size=30,
+    return_list=True,
+    collate_fn=batchify_fn)
+def my_predict(model, data_loader, ds, label_vocab):
+    pred_list = []
+    len_list = []
+    for input_ids, seg_ids, lens, labels in data_loader:
+        logits = model(input_ids, seg_ids)
+        # print(len(logits[0]))
+        pred = paddle.argmax(logits, axis=-1)
+        pred_list.append(pred.numpy())
+        len_list.append(lens.numpy())
+    preds ,tags= parse_decodes(ds, pred_list, len_list, label_vocab)
+    return preds, tags
+
+# Define the model netword and its loss
+model = ErnieForTokenClassification.from_pretrained("ernie-1.0", num_classes=len(label_vocab))
+
+model_dict = paddle.load('ernie_result/model_state.pdparams')
+model.set_dict(model_dict)
+
+
+
+
+
+from utils import *
+preds, tags = my_predict(model, test_loader, test_ds, label_vocab)
+file_path = "ernie_results1.txt"
+with open(file_path, "w", encoding="utf8") as fout:
+    fout.write("\n".join(preds))
+# Print some examples
+print(
+    "The results have been saved in the file: %s, some examples are shown below: "
+    % file_path)
+
+print("\n".join(preds[:20]))
+
+!head ernie_results1.txt
+
+!head ./dataset/final_test.txt
+
+def main():
+    data_list = []
+    with open('ernie_results.txt', encoding='utf-8') as f:
+        data_list = f.readlines()
+    return data_list
+
+
+if __name__ == "__main__":
+    print('1^ A浙江杭州阿里^AB-prov E-prov B-city E-city B-poi E-poi')
+    sentence_list = main()
+    print(len(sentence_list))
+
+    final_test = []
+    with open('dataset/final_test.txt', encoding='utf-8') as f:
+        final_test = f.readlines()
+    test_data = []
+    print(f'{len(final_test)}\t\t{len(sentence_list)}')
+    for i in range(len(final_test)):
+        # test_data.append(final_test[i].strip('\n') + '\001' + sentence_list[i] + '\n')
+        test_data.append(final_test[i].strip('\n').strip(' ') + '\001' + sentence_list[i].strip(' '))
+    with open('predict1.txt', 'w', encoding='utf-8') as f:
+        f.writelines(test_data)
+    print(50 * '*')
+    print('write result ok!')
+    print(50 * '*')
+
+!head predict.txt
+
+import linecache
+
+
+def check(submit_path, test_path, max_num=50000):
+    '''
+    :param submit_path: 选手提交的文件名
+    :param test_path: 原始测试数据名
+    :param max_num: 测试数据大小
+    :return:
+    '''
+    N = 0
+    with open(submit_path, 'r', encoding='utf-8') as fin:
+        for line in fin:
+            line = line.strip()
+            if line == '':
+                continue
+            N += 1
+            parts = line.split('\001')  # id, sent, tags
+            if len(parts) != 3:
+                raise AssertionError(f"分隔符不正确，写入文件时请用'\\001'来分隔ID，句子和预测标签！Error Line:{line.strip()}")
+            elif len(parts[1]) != len(parts[2].split(' ')):
+                print(line)
+                raise AssertionError(f"请保证句子长度和标签长度一致，且标签之间用空格分隔！ID:{parts[0]} Sent:{parts[1]}")
+            elif parts[0] != str(N):
+                raise AssertionError(f"请保证测试数据的ID合法！ID:{parts[0]} Sent:{parts[1]}")
+            else:
+                for tag in parts[2].split(' '):
+                    if (tag == 'O' or tag.startswith('S-')
+                        or tag.startswith('B-')
+                        or tag.startswith('I-')
+                        or tag.startswith('E-')) is False:
+                        raise AssertionError(f"预测结果存在不合法的标签！ID:{parts[0]} Tag:{parts[2]}")
+
+                test_line = linecache.getline(test_path, int(parts[0]))
+                test_sent = test_line.strip().split('\001')[1]
+                if test_sent.strip() != parts[1].strip():
+                    raise AssertionError(f"请不要改变测试数据原文！ID:{parts[0]} Sent:{parts[1]}")
+
+    if N != max_num:
+        raise AssertionError(f"请保证测试数据的完整性(共{max_num}条)，不可丢失或增加数据！")
+
+    print('Well Done ！！')
+check('predict.txt', 'dataset/final_test.txt')--> 
